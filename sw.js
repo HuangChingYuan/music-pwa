@@ -1,5 +1,5 @@
 // Service Worker：快取 App 外殼，離線可開啟。音檔存在 IndexedDB，不經過這裡。
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.0.1';
 const CACHE = `lyric-player-${VERSION}`;
 const SHELL = [
   './',

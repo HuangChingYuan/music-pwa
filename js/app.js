@@ -219,14 +219,30 @@ async function playId(id, autoplay = true) {
   await playIndex(state.pos, autoplay);
 }
 
+/**
+ * 把整首歌讀進記憶體再交給 <audio>。
+ * 直接用 IndexedDB 的 Blob（或剛匯入、Android 以 content:// 提供的 File）建立 blob URL 時，
+ * 播放器是邊播邊讀檔；螢幕關閉後 Android 會降低 Chrome 的優先權，讀檔中斷就會停播。
+ */
+async function memorySource(t) {
+  try { return new Blob([await t.blob.arrayBuffer()], { type: t.type || t.blob.type }); }
+  catch (e) { console.warn('讀入記憶體失敗，改用原始檔', e); return t.blob; }
+}
+
+let loadSeq = 0;
 async function playIndex(pos, autoplay = true, startAt = 0) {
   const id = state.order[pos];
   const t = state.tracks.find(x => x.id === id);
   if (!t) return;
+  const seq = ++loadSeq;
+  if (state.current?.id !== id) playback.tries = 0;
+  playback.lastTime = startAt;
   state.pos = pos;
   state.current = t;
+  const src = await memorySource(t);
+  if (seq !== loadSeq) return;           // 讀檔期間又切了別首
   if (objectUrl) URL.revokeObjectURL(objectUrl);
-  objectUrl = URL.createObjectURL(t.blob);
+  objectUrl = URL.createObjectURL(src);
   audio.src = objectUrl;
   if (startAt) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(startAt, (audio.duration || startAt) - 1); }, { once: true });
   showNowPlaying(t);
@@ -240,6 +256,16 @@ async function playIndex(pos, autoplay = true, startAt = 0) {
       else if (e.name !== 'AbortError') console.warn(e);
     }
   }
+}
+
+const playback = { want: false, lastTime: 0, watchTime: -1, stuck: 0, tries: 0, recoveredAt: 0 };
+function recover(reason) {
+  if (!state.current || !playback.want || playback.tries >= 3) return false;
+  playback.tries++;
+  playback.recoveredAt = playback.lastTime;
+  console.warn(`播放中斷（${reason}），從 ${fmt(playback.lastTime)} 重新載入，第 ${playback.tries} 次`);
+  playIndex(state.pos, true, playback.lastTime);
+  return true;
 }
 
 function next(auto = false) {
@@ -581,8 +607,23 @@ function bindEvents() {
     if (audio.paused) { syncLyrics(); updateProgress(); }
   });
   audio.addEventListener('error', () => {
-    if (state.current && audio.error) toast(`無法播放「${state.current.title}」（格式不支援或檔案損毀）`);
+    if (!state.current || !audio.error) return;
+    if (!recover('error')) toast(`無法播放「${state.current.title}」（格式不支援或檔案損毀）`);
   });
+
+  // 背景播放自我修復：使用者想播、但播放器出錯或卡住不動時，從原位置重新載入
+  // （被來電、其他 App 搶走音訊焦點而暫停的情況會觸發 pause，不會被強行恢復）
+  audio.addEventListener('playing', () => { playback.want = true; });
+  audio.addEventListener('pause', () => { if (!audio.ended && !audio.error) playback.want = false; });
+  audio.addEventListener('timeupdate', () => {
+    if (audio.currentTime > 0) playback.lastTime = audio.currentTime;
+    if (playback.tries && audio.currentTime > playback.recoveredAt + 10) playback.tries = 0;
+  });
+  setInterval(() => {
+    if (!playback.want || audio.paused || audio.ended || state.seeking) { playback.stuck = 0; return; }
+    if (audio.currentTime !== playback.watchTime) { playback.watchTime = audio.currentTime; playback.stuck = 0; return; }
+    if (++playback.stuck >= 3) { playback.stuck = 0; recover('stalled'); }
+  }, 4000);
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) { syncLyrics(true); updateProgress(); startLoop(); }
